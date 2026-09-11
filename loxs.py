@@ -1,3 +1,4 @@
+import queue
 #!/usr/bin/python3
 
 VERSION = 'v2.1.0'
@@ -17,70 +18,52 @@ class Color:
     UNITALIC = '\033[23m'
 
 try:
-    import os
-    import sys
-    import requests
-    from git import Repo
-    import yaml
-    import shutil
-    from flask import session
-    from concurrent.futures import Executor
-    import urllib
-    import signal
-    import sys
-    import threading
-    from urllib.parse import urlsplit
-    import subprocess
-    from urllib.parse import urlunsplit
+    import argparse
     import asyncio
-    from selenium.webdriver.chrome.service import Service
-    import re
-    from rich.progress import Progress
-    import urllib.parse
-    import requests
-    import urllib3
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-    from prompt_toolkit import prompt
-    from prompt_toolkit.completion import PathCompleter
-    from urllib.parse import urlparse
+    import concurrent.futures
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from curses import panel
+    from functools import partial
+    import logging
+    import os
+    from queue import Queue
     import random
     import re
-    from wsgiref import headers
-    from colorama import Fore, Style, init
+    import shutil
+    import signal
+    import subprocess
+    import sys
+    import threading
+    from threading import Lock
+    import time
     from time import sleep
-    from rich import print as rich_print
-    from rich.panel import Panel
-    from rich.table import Table
-    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
+    import urllib
+    import urllib.parse
+    from urllib.parse import parse_qs, quote, urlencode, urlparse, urlsplit, urlunparse, urlunsplit
+
+    import aiohttp
     from bs4 import BeautifulSoup
-    import urllib3
+    from colorama import Fore, Style, init
+    from packaging import version
     from prompt_toolkit import prompt
     from prompt_toolkit.completion import PathCompleter
-    import logging
+    import requests
     from requests.adapters import HTTPAdapter
+    import urllib3
     from urllib3.util.retry import Retry
-    import argparse
-    import concurrent.futures
-    import time
-    import aiohttp
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from webdriver_manager.chrome import ChromeDriverManager
-    from urllib.parse import urlsplit, parse_qs, urlencode, urlunsplit
+    from rich import print as rich_print
     from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import Progress
+    from rich.table import Table
+
+    from selenium import webdriver
     from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
-    from functools import partial
-    from packaging import version
-    from rich.text import Text
-    from queue import Queue
-    from threading import Lock
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+    from webdriver_manager.chrome import ChromeDriverManager
 
     USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -212,6 +195,8 @@ try:
 
         
     def generate_html_report(scan_type, total_found, total_scanned, time_taken, vulnerable_urls):
+        vulnerability_rate = (total_found / total_scanned * 100) if total_scanned > 0 else 0.0
+        vulnerability_rate_str = f"{vulnerability_rate:.2f}%"
         html_content = f"""
         <!DOCTYPE html>
         <html lang="en">
@@ -374,7 +359,7 @@ try:
                     margin-bottom: 1rem;
                 }}
                 .progress {{
-                    width: {(total_found / total_scanned) * 100}%;
+                    width: {vulnerability_rate}%;
                     height: 100%;
                     background-color: var(--secondary-color);
                     animation: pulse 2s infinite;
@@ -611,7 +596,7 @@ try:
                         <div class="stat-label">Scan Duration</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-value">{total_found / total_scanned:.2%}</div>
+                        <div class="stat-value">{vulnerability_rate_str}</div>
                         <div class="stat-label">Vulnerability Rate</div>
                     </div>
                 </div>
@@ -672,6 +657,7 @@ try:
             
             
     def run_sql_scanner(scan_state=None):
+            scan_state_lock = Lock()
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             init(autoreset=True)
             
@@ -692,7 +678,8 @@ try:
                     session.mount('https://', adapter)
                     return session
 
-            def perform_request(url, payload, cookie):
+            session = get_retry_session()
+            def perform_request(url, payload, cookie, session=None):
                 url_with_payload = f"{url}{payload}"
                 start_time = time.time()
                     
@@ -701,7 +688,8 @@ try:
                 }
 
                 try:
-                    response = requests.get(url_with_payload, headers=headers, cookies={'cookie': cookie} if cookie else None)
+                    req_func = session.get if session else requests.get
+                    response = req_func(url_with_payload, headers=headers, cookies={'cookie': cookie} if cookie else None)
                     response.raise_for_status()
                     success = True
                     error_message = None
@@ -712,12 +700,13 @@ try:
                 response_time = time.time() - start_time
                 
                 vulnerability_detected = response_time >= 10
-                if vulnerability_detected and scan_state:
-                    scan_state['vulnerability_found'] = True
-                    scan_state['vulnerable_urls'].append(url_with_payload)
-                    scan_state['total_found'] += 1
                 if scan_state:
-                    scan_state['total_scanned'] += 1
+                    with scan_state_lock:
+                        if vulnerability_detected:
+                            scan_state['vulnerability_found'] = True
+                            scan_state['vulnerable_urls'].append(url_with_payload)
+                            scan_state['total_found'] += 1
+                        scan_state['total_scanned'] += 1
                 
                 return success, url_with_payload, response_time, error_message, vulnerability_detected
 
@@ -729,10 +718,10 @@ try:
                 if issubclass(exc_type, KeyboardInterrupt):
                     print(f"\n{Fore.YELLOW}Program terminated by the user!")
                     save_results(vulnerable_urls, total_found, total_scanned, start_time)
-                    sys.exit(0)
+                    return
                 else:
                     print(f"\n{Fore.RED}An unexpected error occurred: {exc_value}")
-                    sys.exit(0)
+                    return
 
             def save_results(vulnerable_urls, total_found, total_scanned, start_time):
                 generate_report = input(f"{Fore.CYAN}\n[?] Do you want to generate an HTML report? (y/n): ").strip().lower()
@@ -845,7 +834,7 @@ try:
                             print(Fore.YELLOW + f"│{box_content.center(box_width - 2)}│")
                             print(Fore.YELLOW + "└" + "─" * (box_width - 2) + "┘\n")
                             for payload in payloads:
-                                success, url_with_payload, response_time, error_message, vulnerability_detected = perform_request(url, payload, cookie)
+                                success, url_with_payload, response_time, error_message, vulnerability_detected = perform_request(url, payload, cookie, session)
 
                                 if vulnerability_detected:
                                     stripped_payload = url_with_payload.replace(url, '')
@@ -855,9 +844,7 @@ try:
                                         print(f"{Fore.YELLOW}[→] Scanning with payload: {stripped_payload}")
                                         encoded_url_with_payload = encoded_url
                                     else:
-                                        list_stripped_payload = url_with_payload
-                                        for u in urls:
-                                            list_stripped_payload = list_stripped_payload.replace(u, '')
+                                        list_stripped_payload = url_with_payload.replace(url, '')
                                         encoded_stripped_payload = quote(list_stripped_payload, safe='')
 
                                         encoded_url_with_payload = url_with_payload.replace(list_stripped_payload, encoded_stripped_payload)
@@ -875,9 +862,7 @@ try:
                                         print(f"{Fore.YELLOW}[→] Scanning with payload: {stripped_payload}")
                                         encoded_url_with_payload = encoded_url
                                     else:
-                                        list_stripped_payload = url_with_payload
-                                        for u in urls:
-                                            list_stripped_payload = list_stripped_payload.replace(u, '')
+                                        list_stripped_payload = url_with_payload.replace(url, '')
                                         encoded_stripped_payload = quote(list_stripped_payload, safe='')
 
                                         encoded_url_with_payload = url_with_payload.replace(list_stripped_payload, encoded_stripped_payload)
@@ -897,7 +882,7 @@ try:
                                 
                                 futures = []
                                 for payload in payloads:
-                                    futures.append(executor.submit(perform_request, url, payload, cookie))
+                                    futures.append(executor.submit(perform_request, url, payload, cookie, session))
 
                                 for future in concurrent.futures.as_completed(futures):
                                     success, url_with_payload, response_time, error_message, vulnerability_detected = future.result()
@@ -910,9 +895,7 @@ try:
                                             print(f"{Fore.YELLOW}[→] Scanning with payload: {stripped_payload}")
                                             encoded_url_with_payload = encoded_url
                                         else:
-                                            list_stripped_payload = url_with_payload
-                                            for u in urls:
-                                                list_stripped_payload = list_stripped_payload.replace(u, '')
+                                            list_stripped_payload = url_with_payload.replace(url, '')
                                             encoded_stripped_payload = quote(list_stripped_payload, safe='')
 
                                             encoded_url_with_payload = url_with_payload.replace(list_stripped_payload, encoded_stripped_payload)
@@ -935,9 +918,7 @@ try:
                                             print(f"{Fore.YELLOW}[→] Scanning with payload: {stripped_payload}")
                                             encoded_url_with_payload = encoded_url
                                         else:
-                                            list_stripped_payload = url_with_payload
-                                            for u in urls:
-                                                list_stripped_payload = list_stripped_payload.replace(u, '')
+                                            list_stripped_payload = url_with_payload.replace(url, '')
                                             encoded_stripped_payload = quote(list_stripped_payload, safe='')
 
                                             encoded_url_with_payload = url_with_payload.replace(list_stripped_payload, encoded_stripped_payload)
@@ -953,16 +934,17 @@ try:
                 finally:
                     if 'executor' in locals():
                         executor.shutdown(wait=False)
-                    sys.exit(0)
+                    return
 
             if __name__ == "__main__":
                 try:
                     main()
                 except KeyboardInterrupt:
-                    sys.exit(0)
+                    return
 
 
     def run_xss_scanner(scan_state=None):
+        scan_state_lock = Lock()
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         logging.getLogger('WDM').setLevel(logging.ERROR)
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -977,7 +959,7 @@ try:
                     return [line.strip() for line in file if line.strip()]
             except Exception as e:
                 print(Fore.RED + f"[!] Error loading payloads: {e}")
-                exit()
+                return []
 
         def generate_payload_urls(url, payload):
             url_combinations = []
@@ -1021,21 +1003,24 @@ try:
             chrome_options.add_argument("--headless")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--disable-extensions")
             chrome_options.add_argument("--disable-browser-side-navigation")
             chrome_options.add_argument("--disable-infobars")
             chrome_options.add_argument("--disable-notifications")
             chrome_options.page_load_strategy = 'eager'
             logging.disable(logging.CRITICAL)
-            
 
-            driver_service = Service(ChromeDriverManager().install())
-            return webdriver.Chrome(service=driver_service, options=chrome_options)
+            try:
+                driver_service = Service(ChromeDriverManager().install())
+                return webdriver.Chrome(service=driver_service, options=chrome_options)
+            except Exception:
+                return webdriver.Chrome(options=chrome_options)
 
         def get_driver():
             try:
                 return driver_pool.get_nowait()
-            except:
+            except queue.Empty:
                 with driver_lock:
                     return create_driver()
 
@@ -1064,9 +1049,10 @@ try:
                                 print(result)
                                 vulnerable_urls.append(payload_url)
                                 if scan_state:
-                                    scan_state['vulnerability_found'] = True
-                                    scan_state['vulnerable_urls'].append(payload_url)
-                                    scan_state['total_found'] += 1
+                                    with scan_state_lock:
+                                        scan_state['vulnerability_found'] = True
+                                        scan_state['vulnerable_urls'].append(payload_url)
+                                        scan_state['total_found'] += 1
                                 alert.accept()
                             else:
                                 result = Fore.RED + f"[✗]{Fore.CYAN} Not Vulnerable:{Fore.RED} {payload_url}"
@@ -1087,8 +1073,8 @@ try:
             vulnerable_urls = []
             total_scanned = [0]
             
-            for _ in range(3):
-                driver_pool.put(create_driver())
+            # Drivers are lazily initialized on demand in get_driver()
+            pass
             
             try:
                 with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1145,7 +1131,7 @@ try:
                 report_file = save_html_report(html_content, filename)
             else:
                 print(Fore.RED + "\nExiting...")
-                exit()
+                return
 
         def get_file_path(prompt_text):
             completer = PathCompleter()
@@ -1242,11 +1228,11 @@ try:
                 print(Fore.RED + "\n[!] Scan interrupted by the user.")
                 print_scan_summary(scan_state['total_found'], total_scanned, start_time)
                 save_results(scan_state['vulnerable_urls'], scan_state['total_found'], total_scanned, start_time)
-                exit()
+                return
 
             print_scan_summary(scan_state['total_found'], total_scanned, start_time)
             save_results(scan_state['vulnerable_urls'], scan_state['total_found'], total_scanned, start_time)
-            exit()
+            return
 
 
         if __name__ == "__main__":
@@ -1254,10 +1240,11 @@ try:
                 main()
             except KeyboardInterrupt:
                 print(Fore.RED + "\n[!] Scan interrupted by the user. Exiting...")
-                sys.exit()
+                return
 
 
     def run_or_scanner(scan_state=None):
+        scan_state_lock = Lock()
             
 
         init()
@@ -1273,21 +1260,23 @@ try:
                 
             chrome_options = Options()
             chrome_options.add_argument("--headless")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--window-size=1920,1080")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--window-size=1920,1080")
             chrome_options.add_argument("--disable-extensions")
-            chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--disable-browser-side-navigation")
             chrome_options.add_argument("--disable-infobars")
             chrome_options.add_argument("--disable-notifications")
             chrome_options.page_load_strategy = 'eager'
             logging.disable(logging.CRITICAL)
 
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
+            try:
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+            except Exception:
+                driver = webdriver.Chrome(options=chrome_options)
+
             driver.set_page_load_timeout(15)
             drivers.append(driver)
             return driver
@@ -1315,9 +1304,10 @@ try:
                 if "google.com" in current_url:
                     if current_url.startswith("https://google.com") or "google.com" in current_url.split("/")[2]: 
                         if scan_state:
-                            scan_state['vulnerability_found'] = True
-                            scan_state['vulnerable_urls'].append(url)
-                            scan_state['total_found'] += 1
+                            with scan_state_lock:
+                                scan_state['vulnerability_found'] = True
+                                scan_state['vulnerable_urls'].append(url)
+                                scan_state['total_found'] += 1
                         print(Fore.GREEN + f"[✓] Vulnerable: {url}")
                         return True
                     else:
@@ -1357,7 +1347,7 @@ try:
                     path = parsed.path
                     
                     executor = ThreadPoolExecutor(max_workers=max_threads)
-                    futures = []
+                    future_to_url = {}
                     
                     for payload in payloads:
                         if not scan_active:
@@ -1369,22 +1359,22 @@ try:
                         
                         test_url = parsed._replace(path=path + payload)
                         
-                        futures.append(
-                            executor.submit(
-                                check_payload_with_selenium,
-                                url=urllib.parse.urlunparse(test_url),
-                                payload=payload,
-                                param_name='path'
-                            )
+                        test_url_str = urllib.parse.urlunparse(test_url)
+                        fut = executor.submit(
+                            check_payload_with_selenium,
+                            url=test_url_str,
+                            payload=payload,
+                            param_name='path'
                         )
+                        future_to_url[fut] = test_url_str
                     
-                    for future in as_completed(futures):
+                    for future in as_completed(future_to_url):
                         if not scan_active:
                             break
                         try:
                             if future.result():
                                 found_vulnerabilities += 1
-                                vulnerable_urls.append(urllib.parse.urlunparse(test_url))
+                                vulnerable_urls.append(future_to_url[future])
                         except Exception as e:
                             if scan_active:
                                 print(Fore.RED + f"[!] Error testing path: {str(e).splitlines()[0]}")
@@ -1402,7 +1392,7 @@ try:
                     print(Fore.GREEN + f"\n[i] Found parameters: {', '.join(query_params.keys())}")
                     
                     executor = ThreadPoolExecutor(max_workers=max_threads)
-                    futures = []
+                    future_to_url = {}
                     
                     for payload in payloads:
                         if not scan_active:
@@ -1419,28 +1409,27 @@ try:
                             modified_params = query_params.copy()
                             modified_params[param] = [payload]
                             
-                            test_url = urllib.parse.urlunparse(
+                            target_url = urllib.parse.urlunparse(
                                 parsed._replace(
                                     query=urllib.parse.urlencode(modified_params, doseq=True)
                                 )
                             )
                             
-                            futures.append(
-                                executor.submit(
-                                    check_payload_with_selenium, 
-                                    test_url, 
-                                    payload, 
-                                    param
-                                )
+                            fut = executor.submit(
+                                check_payload_with_selenium,
+                                target_url,
+                                payload,
+                                param
                             )
+                            future_to_url[fut] = target_url
                     
-                    for future in as_completed(futures):
+                    for future in as_completed(future_to_url):
                         if not scan_active:
                             break
                         try:
                             if future.result():
                                 found_vulnerabilities += 1
-                                vulnerable_urls.append(test_url)
+                                vulnerable_urls.append(future_to_url[future])
                         except Exception as e:
                             if scan_active:
                                 print(Fore.RED + f"[!] Error testing parameter: {str(e).splitlines()[0]}")
@@ -1454,7 +1443,7 @@ try:
                 for driver in drivers:
                     try:
                         driver.quit()
-                    except:
+                    except Exception:
                         pass
                 drivers.clear()
 
@@ -1481,7 +1470,7 @@ try:
                 for driver in drivers:
                     try:
                         driver.quit()
-                    except:
+                    except Exception:
                         pass
                 drivers.clear()
 
@@ -1493,7 +1482,7 @@ try:
             completer = PathCompleter()
             try:
                 return prompt(prompt_text, completer=completer).strip()
-            except:
+            except Exception:
                 return None
 
         def prompt_for_urls():
@@ -1685,9 +1674,10 @@ try:
                 print(Fore.YELLOW + "\n[-] No vulnerabilities found.")
                 print(Fore.CYAN + f"\n[i] Total URLs scanned: {scan_state['total_scanned']}")
 
-            sys.exit()
+            return
 
     def run_lfi_scanner(scan_state=None):
+        scan_state_lock = Lock()
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         init(autoreset=True)
@@ -1717,18 +1707,26 @@ try:
             return session
         
         def test_lfi(url, payloads, success_criteria, max_threads=5):
+            # Pre-compile success criteria regex patterns for performance
+            compiled_criteria = [
+                pattern if isinstance(pattern, re.Pattern) else re.compile(pattern)
+                for pattern in success_criteria
+            ]
+
+            session = get_retry_session()
+
             def check_payload(payload):
                 encoded_payload = urllib.parse.quote(payload.strip())
                 target_url = f"{url}{encoded_payload}"
                 start_time = time.time()
                 
                 try:
-                    response = requests.get(target_url)
+                    response = session.get(target_url)
                     response_time = round(time.time() - start_time, 2)
                     result = None
                     is_vulnerable = False
                     if response.status_code == 200:
-                        is_vulnerable = any(re.search(pattern, response.text) for pattern in success_criteria)
+                        is_vulnerable = any(pattern.search(response.text) for pattern in compiled_criteria)
                         if is_vulnerable:
                             result = Fore.GREEN + f"[✓]{Fore.CYAN} Vulnerable: {Fore.GREEN} {target_url} {Fore.CYAN} - Response Time: {response_time} seconds"
                         else:
@@ -1736,12 +1734,13 @@ try:
                     else:
                         result = Fore.RED + f"[✗]{Fore.CYAN} Not Vulnerable: {Fore.RED} {target_url} {Fore.CYAN} - Response Time: {response_time} seconds"
 
-                    if is_vulnerable and scan_state:
-                        scan_state['vulnerability_found'] = True
-                        scan_state['vulnerable_urls'].append(target_url)
-                        scan_state['total_found'] += 1
                     if scan_state:
-                        scan_state['total_scanned'] += 1
+                        with scan_state_lock:
+                            if is_vulnerable:
+                                scan_state['vulnerability_found'] = True
+                                scan_state['vulnerable_urls'].append(target_url)
+                                scan_state['total_found'] += 1
+                            scan_state['total_scanned'] += 1
 
                     return result, is_vulnerable
                 except requests.exceptions.RequestException as e:
@@ -1919,9 +1918,10 @@ try:
 
         print(Fore.CYAN + f"\n[i] Total URLs scanned: {scan_state['total_scanned']}")
 
-        exit()
+        return
         
     def run_crlf_scanner(scan_state=None):
+        scan_state_lock = Lock()
         init(autoreset=True)
 
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -1967,10 +1967,12 @@ try:
             
             return [payload.replace('{{Hostname}}', domain) for payload in base_payloads]
 
-        REGEX_PATTERNS = [
+        RAW_PATTERNS = [
             r'(?m)^(?:Location\s*?:\s*(?:https?:\/\/|\/\/|\/\\\\|\/\\)(?:[a-zA-Z0-9\-_\.@]*)loxs\.pages\.dev\/?(\/|[^.].*)?$|(?:Set-Cookie\s*?:\s*(?:\s*?|.*?;\s*)?loxs=injected(?:\s*?)(?:$|;)))',
             r'(?m)^(?:Location\s*?:\s*(?:https?:\/\/|\/\/|\/\\\\|\/\\)(?:[a-zA-Z0-9\-_\.@]*)loxs\.pages\.dev\/?(\/|[^.].*)?$|(?:Set-Cookie\s*?:\s*(?:\s*?|.*?;\s*)?loxs=injected(?:\s*?)(?:$|;)|loxs-x))'
         ]
+        # Pre-compile regex patterns for performance
+        REGEX_PATTERNS = [re.compile(p, re.IGNORECASE) for p in RAW_PATTERNS]
 
         def get_random_user_agent():
             return random.choice(USER_AGENTS)
@@ -1989,7 +1991,7 @@ try:
             session.mount('https://', adapter)
             return session
 
-        def check_crlf_vulnerability(url, payload, scan_state=None):
+        def check_crlf_vulnerability(url, payload, scan_state=None, session=None):
             target_url = f"{url}{payload}"
             start_time = time.time()
 
@@ -2003,8 +2005,8 @@ try:
             result = None
 
             try:
-                session = get_retry_session()
-                response = session.get(target_url, headers=headers, allow_redirects=False, verify=False, timeout=10)
+                sess = session if session else get_retry_session()
+                response = sess.get(target_url, headers=headers, allow_redirects=False, verify=False, timeout=10)
                 response_time = time.time() - start_time
 
                 is_vulnerable = False
@@ -2012,11 +2014,11 @@ try:
 
                 for header, value in response.headers.items():
                     combined_header = f"{header}: {value}"
-                    if any(re.search(pattern, combined_header, re.IGNORECASE) for pattern in REGEX_PATTERNS):
+                    if any(pattern.search(combined_header) for pattern in REGEX_PATTERNS):
                         is_vulnerable = True
                         vulnerability_details.append(f"{Fore.WHITE}Header Injection: {Fore.LIGHTBLACK_EX}{combined_header}")
 
-                if any(re.search(pattern, response.text, re.IGNORECASE) for pattern in REGEX_PATTERNS):
+                if any(pattern.search(response.text) for pattern in REGEX_PATTERNS):
                     is_vulnerable = True
                     vulnerability_details.append(f"{Fore.WHITE}Body Injection: {Fore.LIGHTBLACK_EX}Detected CRLF in response body")
 
@@ -2031,11 +2033,12 @@ try:
                                 f"{Fore.CYAN} - Response Time: {response_time:.2f} seconds")
 
                 if scan_state:
-                    scan_state['total_scanned'] += 1
-                    if is_vulnerable:
-                        scan_state['vulnerability_found'] = True
-                        scan_state['vulnerable_urls'].append(target_url)
-                        scan_state['total_found'] += 1
+                    with scan_state_lock:
+                        scan_state['total_scanned'] += 1
+                        if is_vulnerable:
+                            scan_state['vulnerability_found'] = True
+                            scan_state['vulnerable_urls'].append(target_url)
+                            scan_state['total_found'] += 1
 
                 return result, is_vulnerable
 
@@ -2049,8 +2052,9 @@ try:
             vulnerable_urls = []
             payloads = generate_payloads(url)
 
+            session = get_retry_session()
             with ThreadPoolExecutor(max_workers=max_threads) as executor:
-                future_to_payload = {executor.submit(check_crlf_vulnerability, url, payload): payload for payload in payloads}
+                future_to_payload = {executor.submit(check_crlf_vulnerability, url, payload, None, session): payload for payload in payloads}
                 for future in as_completed(future_to_payload):
                     payload = future_to_payload[future]
                     try:
@@ -2174,7 +2178,7 @@ try:
         save_results(vulnerable_urls, total_found, total_scanned, start_time)
 
         print(Fore.RED + "\nExiting...")
-        exit()
+        return
         
         
     
@@ -2258,8 +2262,9 @@ try:
                 return False
 
         def normalize_version(v):
-            # Remove 'v' prefix if present
-            # v = v.lstrip('v')
+            # Remove leading 'v' or 'V' if present
+            if v and v[0].lower() == 'v':
+                v = v[1:]
 
             # Three components (major.minor.patch)
             parts = v.split('.')
